@@ -15,8 +15,10 @@
 package xds
 
 import (
-	"strconv"
-	"time"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"sort"
 
 	httpcore "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	httproute "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
@@ -136,17 +138,67 @@ func httpRouteMatch(route *metaroute.Route) *httproute.RouteMatch {
 	return routeMatch
 }
 
+// generateSnapshot builds a SnapshotCache snapshot from the given meta protocol routes.
+//
+// The snapshot version is derived solely from the content of the RouteConfiguration resources:
+// identical content always produces the same version, while any content change produces a
+// different version. This replaces the previous time.Now().Unix() based version, which could
+// collide for changes happening within the same second (causing SnapshotCache to skip the push
+// because the version was unchanged) and was different on every Aeraki replica (causing
+// redundant full pushes and potentially non-monotonic versions when Envoy reconnected to another
+// replica with a skewed clock).
+//
+// The resources are sorted by name and each one is deterministically serialized (see
+// computeSnapshotVersion), so the version does not depend on the order in which the config store
+// returns ServiceEntries. Note that the version string format changes from a unix timestamp to a
+// SHA256 hex digest; already connected Envoys will observe one full RDS push on upgrade, which is
+// an acceptable compatibility cost.
 func generateSnapshot(metaRoutes []*metaroute.RouteConfiguration) (*cache.Snapshot, error) {
-	var httpRoutes []types.Resource
+	httpRoutes := make([]types.Resource, 0, len(metaRoutes))
 	for _, route := range metaRoutes {
 		httpRoutes = append(httpRoutes, metaProtocolRoute2HttpRoute(route))
 	}
+
+	version, err := computeSnapshotVersion(httpRoutes)
+	if err != nil {
+		return nil, err
+	}
 	return cache.NewSnapshot(
-		strconv.FormatInt(time.Now().Unix(), 10),
+		version,
 		map[resource.Type][]types.Resource{
 			resource.RouteType: httpRoutes,
 		},
 	)
+}
+
+// computeSnapshotVersion returns a content-based version string for the given route resources.
+//
+// The resources are sorted by their resource name first, so the result is independent of the
+// ordering produced by the config store. Each resource is then marshaled with deterministic
+// protobuf serialization (deterministic map ordering and no unstable fields), and the resulting
+// byte slices are length-prefixed and fed into a SHA256 hash. The length prefixes guarantee that
+// no concatenation of neighboring resources can produce the same digest.
+func computeSnapshotVersion(routes []types.Resource) (string, error) {
+	sortedRoutes := make([]types.Resource, len(routes))
+	copy(sortedRoutes, routes)
+	sort.Slice(sortedRoutes, func(i, j int) bool {
+		return cache.GetResourceName(sortedRoutes[i]) < cache.GetResourceName(sortedRoutes[j])
+	})
+
+	hasher := sha256.New()
+	for _, route := range sortedRoutes {
+		marshaled, err := cache.MarshalResource(route)
+		if err != nil {
+			return "", err
+		}
+		// Prefix each marshaled resource with its length to keep the hash unambiguous even if two
+		// adjacent resources were to be concatenated into the same byte sequence.
+		var lengthBuf [8]byte
+		binary.BigEndian.PutUint64(lengthBuf[:], uint64(len(marshaled)))
+		hasher.Write(lengthBuf[:])
+		hasher.Write(marshaled)
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // MetaMatch2HttpHeaderMatch converts MetaMatch to HttpHeaderMatch

@@ -17,6 +17,8 @@ package xds
 import (
 	"context"
 	"fmt"
+
+	"sort"
 	"strings"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/zhaohuabing/debounce"
 	networking "istio.io/api/networking/v1alpha3"
@@ -129,6 +132,16 @@ func (c *CacheMgr) updateRouteCache() error {
 	}
 
 	for _, node := range c.routeCache.GetStatusKeys() {
+		// The snapshot version is a content hash, so an equal version means the node already
+		// holds a snapshot with identical content. Skip SetSnapshot in that case to avoid
+		// meaningless snapshot replacements and noisy logs. SnapshotCache would also ignore such
+		// an update when notifying watches, but replacing the stored snapshot would still churn
+		// the cache for nothing.
+		if current, err := c.routeCache.GetSnapshot(node); err == nil &&
+			current.GetVersion(resource.RouteType) == snapshot.GetVersion(resource.RouteType) {
+			xdsLog.Debugf("route cache content unchanged for: %s, skip setting snapshot", node)
+			continue
+		}
 		xdsLog.Debugf("set route cahe for: %s", node)
 		if err := c.routeCache.SetSnapshot(context.TODO(), node, snapshot); err != nil {
 			xdsLog.Errorf("failed to set route cache: %v", err)
@@ -192,6 +205,14 @@ func (c *CacheMgr) generateMetaRoutes(serviceEntries []istioconfig.Config) []*me
 			}
 		}
 	}
+
+	// configStore.List returns resources from an unordered map, so the traversal order above is not
+	// stable across calls or replicas. Sort by route name (host plus port) to make the generated
+	// output deterministic; the snapshot version is a hash of this output and must stay stable for
+	// identical content.
+	sort.Slice(routes, func(i, j int) bool {
+		return routes[i].Name < routes[j].Name
+	})
 	return routes
 }
 
